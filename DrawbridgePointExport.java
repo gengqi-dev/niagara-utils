@@ -93,7 +93,7 @@ public class MyTask implements Runnable {
 
       try {
         PointImportRow importRow = parseRow(row, rowIndex + 1);
-        BControlPoint source = resolveSourcePoint(importRow);
+        BControlPoint source = resolveSourcePoint(importRow, file);
         BModbusTcpSlaveDevice device = getOrCreateDevice(network, importRow);
         BControlPoint point = upsertPoint(device, importRow, source);
 
@@ -139,7 +139,7 @@ public class MyTask implements Runnable {
       throw new IllegalArgumentException("Device name is blank");
 
     int deviceNumber = parseInteger("device number", columns[DEV_NO_COL]);
-    int registerNumber = parseInteger("register number", columns[REG_NO_COL]);
+    int registerNumber = normalizeRegisterNumber(columns[REG_NO_COL]);
     if (registerNumber < 0)
       throw new IllegalArgumentException("Register number cannot be negative: " + registerNumber);
 
@@ -212,6 +212,15 @@ public class MyTask implements Runnable {
     }
   }
 
+  private int normalizeRegisterNumber(String value) {
+    String registerValue = trim(value);
+    int registerNumber = parseInteger("register number", registerValue);
+    if (registerValue.length() == 5 && registerValue.charAt(0) == '4')
+      return registerNumber - 40001;
+
+    return registerNumber;
+  }
+
   private String buildPointName(boolean holdingRegister, DataTypeEnum dataType, int registerNumber) {
     if (!holdingRegister)
       return SlotPath.escape("Coil" + registerNumber);
@@ -223,7 +232,7 @@ public class MyTask implements Runnable {
     throw new IllegalArgumentException("Unsupported point type for register " + registerNumber);
   }
 
-  private BControlPoint resolveSourcePoint(PointImportRow row) throws Exception {
+  private BControlPoint resolveSourcePoint(PointImportRow row, BIFile file) throws Exception {
     if (row.hasNullSource()) {
       job.log().message("Found NULL Ord for " + row.pointName + ", creating point without source link");
       return null;
@@ -231,8 +240,21 @@ public class MyTask implements Runnable {
 
     BControlPoint source = null;
     boolean recordPointNotFound = false;
+    String retrySourceOrd = "";
     try {
       source = findSourcePointByProxy(row.sourceOrd);
+      if (source == null) {
+        retrySourceOrd = repeatLastPathField(row.sourceOrd);
+        if (!retrySourceOrd.equals(row.sourceOrd)) {
+          job.log().message("No ControlPoint found for " + row.sourceOrd + "; retrying with " + retrySourceOrd);
+          source = findSourcePointByProxy(retrySourceOrd);
+          if (source != null) {
+            recordPointNotFound(file, row, retrySourceOrd);
+            job.log().message("ControlPoint found after retry for " + row.sourceOrd + "; recorded corrected sourceOrd "
+                + retrySourceOrd + " in " + POINT_NOT_FOUND_FILE);
+          }
+        }
+      }
       recordPointNotFound = source == null;
     } catch (Exception e) {
       job.log().failed("Could not resolve source by proxy: " + row.sourceOrd, e);
@@ -240,17 +262,18 @@ public class MyTask implements Runnable {
     }
 
     if (recordPointNotFound) {
-      recordPointNotFound(row.sourceOrd);
-      job.log().message("No source point found by proxy for " + row.sourceOrd + "; recorded in "
-          + POINT_NOT_FOUND_FILE);
+      recordPointNotFound(file, row, "");
+      job.log().message("No ControlPoint found by SRC_ORD_COL proxy condition for " + row.sourceOrd
+          + "; recorded in " + POINT_NOT_FOUND_FILE);
     }
 
     return source;
   }
 
   private BControlPoint findSourcePointByProxy(String sourceOrd) throws Exception {
+    String proxyOrd = sourceOrd.replace('$', '%');
     String bql = SOURCE_QUERY_BASE_ORD + "select slotPath from control:ControlPoint where proxyExt like '"
-        + escapeBqlString(sourceOrd) + "'";
+        + escapeBqlString(proxyOrd) + "'";
     BStation station = Sys.getStation();
     BITable result = (BITable) BOrd.make(bql).get(station);
     ColumnList columns = result.getColumns();
@@ -267,8 +290,16 @@ public class MyTask implements Runnable {
     return null;
   }
 
-  private void recordPointNotFound(String sourceOrd) {
-    pointNotFoundRows.add(toCsvValue(sourceOrd));
+  private void recordPointNotFound(BIFile file, PointImportRow row, String retrySourceOrd) {
+    StringBuffer buffer = new StringBuffer();
+    appendCsvValue(buffer, file.getFilePath().toString());
+    appendCsvValue(buffer, String.valueOf(row.lineNumber));
+    appendCsvValue(buffer, row.deviceName);
+    appendCsvValue(buffer, String.valueOf(row.deviceNumber));
+    appendCsvValue(buffer, row.pointName);
+    appendCsvValue(buffer, row.sourceOrd);
+    appendCsvValue(buffer, retrySourceOrd);
+    pointNotFoundRows.add(buffer.toString());
   }
 
   private void writePointNotFoundFile() throws Exception {
@@ -276,6 +307,8 @@ public class MyTask implements Runnable {
 
     try (java.io.BufferedWriter writer = new java.io.BufferedWriter(
         new java.io.OutputStreamWriter(file.getOutputStream(), "UTF-8"))) {
+      writer.write("file,line,deviceName,deviceNumber,pointName,sourceOrd,retrySourceOrd");
+      writer.newLine();
       for (int i = 0; i < pointNotFoundRows.size(); i++) {
         writer.write(pointNotFoundRows.get(i));
         writer.newLine();
@@ -512,6 +545,23 @@ public class MyTask implements Runnable {
     return value.replace("'", "''");
   }
 
+  private String repeatLastPathField(String value) {
+    String sourceOrd = trim(value);
+    int end = sourceOrd.length();
+    while (end > 0 && sourceOrd.charAt(end - 1) == '/')
+      end--;
+
+    if (end == 0)
+      return sourceOrd;
+
+    int start = sourceOrd.lastIndexOf('/', end - 1) + 1;
+    String lastField = sourceOrd.substring(start, end);
+    if (lastField.length() == 0)
+      return sourceOrd;
+
+    return sourceOrd.substring(0, end) + "/" + lastField;
+  }
+
   private String joinColumns(String[] columns) {
     StringBuffer buffer = new StringBuffer();
     for (int i = 0; i < columns.length; i++) {
@@ -530,6 +580,13 @@ public class MyTask implements Runnable {
       return safeValue;
 
     return "\"" + safeValue.replace("\"", "\"\"") + "\"";
+  }
+
+  private void appendCsvValue(StringBuffer buffer, String value) {
+    if (buffer.length() > 0)
+      buffer.append(',');
+
+    buffer.append(toCsvValue(value));
   }
 
   private String trim(String value) {
