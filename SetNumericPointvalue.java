@@ -2,15 +2,21 @@ public void onStart() throws Exception {
     // start up code here
 }
 
+public void onStop() throws Exception {
+    // shutdown code here
+}
+
 public void onExecute() throws Exception {
-    SetNumericPointTask task = new SetNumericPointTask();
+    SetNumericPointTask task = new SetNumericPointTask(false);
     task.submit();
 }
 
 public class SetNumericPointTask implements Runnable {
     private static final String JOB_NAME = "Set Numeric Point Value";
+    private static final String RESET_JOB_NAME = "Reset Numeric Point Value";
 
-    public SetNumericPointTask() {
+    public SetNumericPointTask(boolean resetMode) {
+        this.resetMode = resetMode;
         job = new NamedRunnableJob(this);
     }
 
@@ -23,6 +29,11 @@ public class SetNumericPointTask implements Runnable {
 
         try {
             BOrd folderOrd = getFolderOrd();
+            if (folderOrd == null) {
+                job.log().message("Folder Ord is null!");
+                return;
+            }
+
             job.log().message("Resolving folder: " + folderOrd);
 
             BComponent folder = (BComponent) folderOrd.resolve().get();
@@ -31,46 +42,135 @@ public class SetNumericPointTask implements Runnable {
                 return;
             }
 
-            double targetValue = getStartValue();
-            int applied = 0;
-            int unchanged = 0;
-            int skipped = 0;
-            BComponent[] children = folder.getChildren(BComponent.class);
-
-            for (int i = 0; i < children.length; i++) {
-                BComponent child = children[i];
-
-                if (child instanceof BNumericWritable) {
-                    BNumericWritable nw = (BNumericWritable) child;
-                    // if (isOutEqual(nw, targetValue)) {
-                    // job.log().message("Point skipped unchanged: " + child.getName() + " -> " +
-                    // targetValue);
-                    // unchanged++;
-                    // } else {
-                    nw.setIn1(new BStatusNumeric(targetValue));
-                    nw.set(BDouble.make(targetValue));
-                    job.log().message("Point set successfully: " + child.getName() + " -> " + targetValue);
-                    applied++;
-                    // }
-
-                    targetValue += 2.0;
-                } else {
-                    skipped++;
-                }
-
-                job.progress(progress(i + 2, children.length));
+            if (resetMode) {
+                resetRoot(folder);
+                return;
             }
 
+            int[] stats = new int[1];
+            int[] completed = new int[1];
+            java.util.List<java.util.List<BNumericWritable>> pointGroups = findNumericWritablePointGroups(folder);
+            int totalPoints = countPoints(pointGroups);
+            job.log().message("Found numeric writable points: " + totalPoints);
+
+            processPointGroups(pointGroups, stats, completed, totalPoints);
+
             job.progress(100);
-            job.log().success("ended task [" + Thread.currentThread().getName() + "] applied=" + applied
-                    + ", unchanged=" + unchanged + ", skipped=" + skipped);
+            job.log().success("ended task [" + Thread.currentThread().getName() + "] applied=" + stats[0]);
         } catch (Exception e) {
             job.log().failed("Failed to set numeric point values", e);
         }
     }
 
-    private boolean isOutEqual(BNumericWritable point, double targetValue) {
-        return Double.compare(point.getOut().getValue(), targetValue) == 0;
+    private void processPointGroups(java.util.List<java.util.List<BNumericWritable>> pointGroups, int[] stats,
+            int[] completed, int totalPoints) {
+        for (int i = 0; i < pointGroups.size(); i++) {
+            processPointList(pointGroups.get(i), stats, completed, totalPoints);
+        }
+    }
+
+    private void processPointList(java.util.List<BNumericWritable> points, int[] stats, int[] completed,
+            int totalPoints) {
+        double targetValue = getStartValue();
+
+        for (int i = 0; i < points.size(); i++) {
+            BNumericWritable nw = points.get(i);
+
+            nw.setIn1(new BStatusNumeric(targetValue));
+            nw.set(BDouble.make(targetValue));
+            job.log().message("Point set successfully: " + nw.getName() + " -> " + targetValue);
+            stats[0]++;
+
+            targetValue += 2.0;
+            completed[0]++;
+            job.progress(progress(completed[0], totalPoints));
+        }
+    }
+
+    private void resetRoot(BComponent root) {
+        java.util.List<java.util.List<BNumericWritable>> pointGroups = findNumericWritablePointGroups(root);
+        int totalPoints = countPoints(pointGroups);
+        int[] completed = new int[1];
+        job.log().message("Found numeric writable points to reset: " + totalPoints);
+
+        resetPointGroups(pointGroups, completed, totalPoints);
+
+        job.progress(100);
+        job.log().success("ended task [" + Thread.currentThread().getName() + "] reset=" + completed[0]);
+    }
+
+    private void resetPointGroups(java.util.List<java.util.List<BNumericWritable>> pointGroups, int[] completed,
+            int totalPoints) {
+        for (int i = 0; i < pointGroups.size(); i++) {
+            resetPointList(pointGroups.get(i), completed, totalPoints);
+        }
+    }
+
+    private void resetPointList(java.util.List<BNumericWritable> points, int[] completed, int totalPoints) {
+        for (int i = 0; i < points.size(); i++) {
+            BNumericWritable nw = points.get(i);
+            nw.setIn1(new BStatusNumeric(0, BStatus.nullStatus));
+            nw.set(BDouble.make(0));
+            job.log().message("Point value reset: " + nw.getName());
+            completed[0]++;
+            job.progress(progress(completed[0], totalPoints));
+        }
+    }
+
+    private java.util.List<java.util.List<BNumericWritable>> findNumericWritablePointGroups(BComponent root) {
+        java.util.List<java.util.List<BNumericWritable>> pointGroups = new java.util.ArrayList<java.util.List<BNumericWritable>>();
+
+        if (root instanceof BModbusTcpSlaveNetwork) {
+            BComponent[] devices = ((BModbusTcpSlaveNetwork) root).getChildComponents();
+            for (int i = 0; i < devices.length; i++) {
+                if (devices[i] instanceof BModbusTcpSlaveDevice) {
+                    pointGroups.add(findDevicePoints((BModbusTcpSlaveDevice) devices[i]));
+                }
+            }
+        } else if (root instanceof BModbusTcpSlaveDevice) {
+            pointGroups.add(findDevicePoints((BModbusTcpSlaveDevice) root));
+        } else {
+            pointGroups.add(findDirectChildPoints(root));
+        }
+
+        return pointGroups;
+    }
+
+    private int countPoints(java.util.List<java.util.List<BNumericWritable>> pointGroups) {
+        long count = 0;
+        for (int i = 0; i < pointGroups.size(); i++) {
+            count += pointGroups.get(i).size();
+        }
+
+        return count > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) count;
+    }
+
+    private java.util.List<BNumericWritable> findDevicePoints(BModbusTcpSlaveDevice device) {
+        java.util.List<BNumericWritable> points = new java.util.ArrayList<BNumericWritable>();
+        BModbusServerPointDeviceExt pointDeviceExt = device.getPoints();
+        if (pointDeviceExt == null) {
+            job.log().message("Device has no points extension: " + device.getName());
+            return points;
+        }
+
+        BComponent[] children = pointDeviceExt.getChildComponents();
+        for (int i = 0; i < children.length; i++) {
+            if (children[i] instanceof BNumericWritable) {
+                points.add((BNumericWritable) children[i]);
+            }
+        }
+        return points;
+    }
+
+    private java.util.List<BNumericWritable> findDirectChildPoints(BComponent folder) {
+        java.util.List<BNumericWritable> points = new java.util.ArrayList<BNumericWritable>();
+        BComponent[] children = folder.getChildren(BComponent.class);
+        for (int i = 0; i < children.length; i++) {
+            if (children[i] instanceof BNumericWritable) {
+                points.add((BNumericWritable) children[i]);
+            }
+        }
+        return points;
     }
 
     private int progress(int completed, int total) {
@@ -78,10 +178,12 @@ public class SetNumericPointTask implements Runnable {
             return 100;
         }
 
-        return Math.min(100, Math.max(0, (completed * 100) / total));
+        long percent = ((long) completed * 100L) / (long) total;
+        return (int) Math.min(100L, Math.max(0L, percent));
     }
 
     private BRunnableJob job;
+    private boolean resetMode;
 
     private class NamedRunnableJob extends BRunnableJob {
         private NamedRunnableJob(Runnable runnable) {
@@ -89,46 +191,12 @@ public class SetNumericPointTask implements Runnable {
         }
 
         public String toString(javax.baja.sys.Context context) {
-            return JOB_NAME;
+            return resetMode ? RESET_JOB_NAME : JOB_NAME;
         }
     }
 }
 
 public void onReset() throws Exception {
-
-    // Assume you already have a BOrd input slot pointing to the Ord folder
-    BOrd folderOrd = getFolderOrd(); // ordFolder is the BOrd input slot you added
-    BComponent folder = null;
-    try {
-        folder = (BComponent) folderOrd.resolve().get(); // or use .resolve().get()
-    } catch (Exception e) {
-        System.err.println("Failed to resolve folder: " + e.getMessage());
-    }
-
-    if (folder == null) {
-        System.err.println("Folder not found!");
-        return;
-    }
-
-    // double targetValue = getStartValue(); // ← Change to your desired value, e.g.
-    // 25.0
-    for (BComponent child : folder.getChildren(BComponent.class)) {
-        try {
-
-            if (child instanceof BNumericWritable) {
-                BNumericWritable nw = (BNumericWritable) child;
-                nw.setIn1(new BStatusNumeric(0, BStatus.nullStatus));
-                nw.set(BDouble.make(0));
-                System.out.println("Point value reset");
-
-            }
-
-        } catch (Exception e) {
-            System.err.println("Failed to set point: " + child.getName() + " → " + e.getMessage());
-        }
-    }
-}
-
-public void onStop() throws Exception {
-    // shutdown code here
+    SetNumericPointTask task = new SetNumericPointTask(true);
+    task.submit();
 }
