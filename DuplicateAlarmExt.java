@@ -2,8 +2,10 @@
  * Niagara Program Object slots required:
  *
  *   parentFolderOrd  BOrd    - folder/component to search recursively
- *   newAlarmClass    String  - alarm class assigned to each copied extension
  *   newExtensionName String  - optional copied-extension name
+ *
+ * Critical, High, and Warning alarm extensions are copied and assigned the
+ * source alarm class plus "_4Email".
  *
  * Run the Program Object's standard Execute action.
  * Optionally add a no-argument action named duplicateAlarmExts; its handler is
@@ -12,6 +14,9 @@
 
 private static final String DEFAULT_EXTENSION_SUFFIX = "Send_Email";
 private static final String DEFAULT_ALARM_CLASS_SUFFIX = "_4Email";
+private static final String ALARM_CLASS_CRITICAL = "Critical";
+private static final String ALARM_CLASS_HIGH = "High";
+private static final String ALARM_CLASS_WARNING = "Warning";
 
 public void onStart() throws Exception {
     // No startup work is required.
@@ -92,11 +97,25 @@ private void copyPointAlarmExts(
 
         stats[1]++;
 
-        final String originalClass = alarmExt.getAlarmClass();
-        if (originalClass != null && originalClass.endsWith(DEFAULT_ALARM_CLASS_SUFFIX)) {
+        final String originalClass = trimToEmpty(alarmExt.getAlarmClass());
+        if (originalClass.length() == 0) {
+            stats[3]++;
+            logWarning("Skipping " + point.getSlotPath() + "/" + alarmExt.getName()
+                    + " because the source alarm class is empty");
+            continue;
+        }
+
+        if (originalClass.endsWith(DEFAULT_ALARM_CLASS_SUFFIX)) {
             stats[3]++;
             logInfo("Skipping " + point.getSlotPath() + "/" + alarmExt.getName()
                     + " (already has target suffix: " + originalClass + ")");
+            continue;
+        }
+
+        if (!isDuplicateAlarmClass(originalClass)) {
+            stats[3]++;
+            logInfo("Skipping " + point.getSlotPath() + "/" + alarmExt.getName()
+                    + " because alarm class is not Critical, High, or Warning: " + originalClass);
             continue;
         }
 
@@ -112,7 +131,7 @@ private void copyPointAlarmExts(
         try {
             final javax.baja.alarm.ext.BAlarmSourceExt copy = (javax.baja.alarm.ext.BAlarmSourceExt) alarmExt.newCopy();
 
-            String alarmClass = trimToEmpty(alarmExt.getAlarmClass() + DEFAULT_ALARM_CLASS_SUFFIX);
+            String alarmClass = originalClass + DEFAULT_ALARM_CLASS_SUFFIX;
             copy.setAlarmClass(alarmClass);
             point.add(targetName, copy);
             stats[2]++;
@@ -140,6 +159,12 @@ private boolean hasProperty(javax.baja.sys.BComponent component, String name) {
     } catch (Exception e) {
         return false;
     }
+}
+
+private boolean isDuplicateAlarmClass(String alarmClass) {
+    return ALARM_CLASS_CRITICAL.equalsIgnoreCase(alarmClass) ||
+            ALARM_CLASS_HIGH.equalsIgnoreCase(alarmClass) ||
+            ALARM_CLASS_WARNING.equalsIgnoreCase(alarmClass);
 }
 
 private String trimToEmpty(String value) {
